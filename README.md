@@ -8,37 +8,22 @@ The code is organised to reproduce  an offline classifier (per-device vs shared 
 
 This project uses the [UCI-HAR dataset](https://archive.ics.uci.edu/ml/datasets/Human+Activity+Recognition+Using+Smartphones).
 
+
 UCI_HAR_Dataset/
-├── train/
-│   ├── Inertial Signals/
-│   │   ├── body_acc_x_train.txt
-│   │   ├── body_acc_y_train.txt
-│   │   ├── body_acc_z_train.txt
-│   │   ├── body_gyro_x_train.txt
-│   │   ├── body_gyro_y_train.txt
-│   │   ├── body_gyro_z_train.txt
-│   │   ├── total_acc_x_train.txt
-│   │   ├── total_acc_y_train.txt
-│   │   ├── total_acc_z_train.txt
-│   ├── X_train.txt
-│   ├── y_train.txt
-│   ├── subject_train.txt
-├── test/
-│   ├── Inertial Signals/
-│   │   ├── body_acc_x_test.txt
-│   │   ├── body_acc_y_test.txt
-│   │   ├── body_acc_z_test.txt
-│   │   ├── body_gyro_x_test.txt
-│   │   ├── body_gyro_y_test.txt
-│   │   ├── body_gyro_z_test.txt
-│   │   ├── total_acc_x_test.txt
-│   │   ├── total_acc_y_test.txt
-│   │   ├── total_acc_z_test.txt
-│   ├── X_test.txt
-│   ├── y_test.txt
-│   ├── subject_test.txt
+├── train/ (inertial signals and labels for training)
+├── test/ (inertial signals and labels for testing)
 ├── activity_labels.txt
 ├── features.txt
 ├── features_info.txt
 ├── README.txt
 
+
+
+
+## Offline Classification
+
+The script `per_device_vs_shared.py` trains and evaluates ESN+LR classifiers in two configurations:
+- **Per-device**: training ESNs on Dirichlet-partitioned splits of the dataset to simulate six heterogeneous devices.  
+- **Shared baseline**: using a single pooled reservoir (R = 1200) that is sliced into feasible sizes {400, 600, 800, 1200} and shared across all devices. 
+
+The results are logged to CSV and plotted to compare accuracy across the different reservoir sizes.
