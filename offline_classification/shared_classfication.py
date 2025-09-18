@@ -10,9 +10,9 @@ Shared ESN Classifier (UCI HAR)
 - Saves artefacts (ESN weights, scaler, PCA, LR, T*, normalisation stats) to a .pkl.
 
 Run:
-  python shared_esn_classifier.py \
-    --data_dir /path/to/UCI_HAR_Dataset \
-    --save_path artefacts_shared_esn.pkl
+  python offline_classification/shared_classification.py \
+    --data_dir ./data/UCI_HAR_Dataset \
+    --save_path artifacts/shared_esn.pkl
 
 Notes:
 - UCI HAR labels (after subtracting 1) map to:
@@ -29,7 +29,6 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score, log_loss, confusion_matrix
 from sklearn.exceptions import ConvergenceWarning
 
-# Optional plotting
 try:
     import matplotlib.pyplot as plt
     _HAS_PLT = True
@@ -148,18 +147,25 @@ def expected_calibration_error(probs, y_true, M=15):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str,
-                        default=os.getenv("UCI_HAR_DIR", "/content/drive/MyDrive/UCI_HAR_Dataset"),
-                        help="Path to UCI HAR root containing 'train' and 'test' folders.")
-    parser.add_argument("--save_path", type=str, default="artefacts_shared_esn.pkl",
-                        help="Where to save trained artefacts (.pkl).")
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default=os.getenv("UCI_HAR_DIR", "./data/UCI_HAR_Dataset"),
+        help="Path to UCI HAR root containing 'train' and 'test' folders."
+    )
+    parser.add_argument(
+        "--save_path",
+        type=str,
+        default="artifacts/shared_esn.pkl",   # repo-friendly default
+        help="Where to save trained artefacts (.pkl)."
+    )
     parser.add_argument("--no_plot", action="store_true", help="Disable confusion-matrix plot.")
     parser.add_argument("--seed", type=int, default=RNG_SEED, help="Random seed.")
     args = parser.parse_args()
 
     np.random.seed(args.seed)
 
-    # Optional: mount Google Drive when running in Colab
+    # Optional: mount Google Drive if running in Colab
     if ("google.colab" in sys.modules) and args.data_dir.startswith("/content/drive"):
         try:
             from google.colab import drive
@@ -167,27 +173,27 @@ def main():
         except Exception:
             pass
 
-    # Load data
+    
     X_train_full, y_train_full, X_test_full, y_test_full = load_uci_har(args.data_dir)
     assert X_train_full.shape[1:] == (T_EXPECTED, C_EXPECTED), "Unexpected train shape"
     assert X_test_full.shape[1:]  == (T_EXPECTED, C_EXPECTED), "Unexpected test shape"
     for y_arr, nm in [(y_train_full, "y_train"), (y_test_full, "y_test")]:
         assert y_arr.min() == 0 and y_arr.max() == K_CLASSES - 1, f"{nm} must be in [0,{K_CLASSES-1}]"
 
-    # Split train/val
+    
     X_tr, X_va, y_tr, y_va = train_test_split(
         X_train_full, y_train_full, test_size=0.20, random_state=args.seed, stratify=y_train_full
     )
     X_te, y_te = X_test_full, y_test_full
 
-    # Normalisation stats from train split
+    
     mu  = X_tr.mean(axis=(0, 1), keepdims=True).astype(np.float32)
     sd  = (X_tr.std(axis=(0, 1), keepdims=True) + 1e-8).astype(np.float32)
     def norm(X): return (X - mu) / sd
 
     X_tr_z, X_va_z, X_te_z = norm(X_tr), norm(X_va), norm(X_te)
 
-    # Build shared ESN (full reservoir)
+    
     Win_full, Wres_full = init_esn_full(
         C=C_EXPECTED, R_full=R_FULL, input_scale=INPUT_SCALE,
         spectral=SPECTRAL, sparsity=SPARSITY, seed=args.seed
@@ -202,7 +208,7 @@ def main():
         H_va = esn_encode_batch(X_va_z, Win_full, Wres_full, R, LEAK, WASHOUT)
         H_te = esn_encode_batch(X_te_z, Win_full, Wres_full, R, LEAK, WASHOUT)
 
-        # Scale + PCA
+        
         scaler = StandardScaler().fit(H_tr)
         Z_tr = scaler.transform(H_tr)
         Z_va = scaler.transform(H_va)
@@ -213,7 +219,7 @@ def main():
         Z_va = pca.transform(Z_va)
         Z_te = pca.transform(Z_te)
 
-        # Multinomial LR for consistent logits
+        
         clf = LogisticRegression(
             max_iter=6000, solver="lbfgs", C=0.7, random_state=args.seed, multi_class="multinomial"
         )
@@ -226,17 +232,17 @@ def main():
                 )
                 clf.fit(Z_tr, y_tr)
 
-        # Temperature scaling on validation logits
+        
         z_va = clf.decision_function(Z_va)
         T_star = grid_temperature(z_va, y_va)
 
-        # Validation accuracy
+        
         z_va_T = z_va / max(T_star, 1e-8)
         z_va_T -= z_va_T.max(axis=1, keepdims=True)
         P_va = np.exp(z_va_T); P_va /= P_va.sum(axis=1, keepdims=True)
         val_acc = accuracy_score(y_va, P_va.argmax(1))
 
-        # Test metrics
+        
         z_te = clf.decision_function(Z_te) / max(T_star, 1e-8)
         z_te -= z_te.max(axis=1, keepdims=True)
         P_te = np.exp(z_te); P_te /= P_te.sum(axis=1, keepdims=True)
@@ -259,9 +265,8 @@ def main():
 
     print(f"\n>> Best slice by validation accuracy: R={best_R} (val acc={best_val_acc:.4f})")
 
-    # Evaluate best slice in detail
+    
     best = results[best_R]
-    # Re-encode test (already encoded above, but re-do to be explicit)
     H_te_best = esn_encode_batch(X_te_z, Win_full, Wres_full, best_R, LEAK, WASHOUT)
     Z_te_best = best["pca"].transform(best["scaler"].transform(H_te_best))
     z_te = best["clf"].decision_function(Z_te_best) / max(best["T"], 1e-8)
@@ -276,7 +281,7 @@ def main():
 
     print(f"\n[Test @ R={best_R}] Acc={acc:.4f} | Macro-F1={mf1:.4f} | NLL={nll:.4f} | ECE={ece*100:.2f}%")
 
-    # Confusion matrix
+    
     cm = confusion_matrix(y_te, y_pred, labels=np.arange(K_CLASSES))
     if _HAS_PLT and (not args.no_plot):
         fig, ax = plt.subplots(figsize=(6.5, 5.2))
@@ -293,7 +298,7 @@ def main():
         plt.tight_layout()
         plt.show()
 
-    # Save artefacts for downstream routing/system evaluation
+    
     artefacts = {
         "R_full": R_FULL,
         "best_R": best_R,
@@ -323,6 +328,10 @@ def main():
             }
         }
     }
+
+    
+    os.makedirs(os.path.dirname(args.save_path) or ".", exist_ok=True)
+
     with open(args.save_path, "wb") as f:
         pickle.dump(artefacts, f)
     print(f"[saved] Artefacts -> {args.save_path}")
