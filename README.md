@@ -21,6 +21,12 @@ UCI_HAR_Dataset/
 ├── features_info.txt
 ├── README.txt
 ```
+## Installation
+
+Install dependencies with:
+
+pip install -r requirements.txt
+
 
 ```
 ## Repository Structure
