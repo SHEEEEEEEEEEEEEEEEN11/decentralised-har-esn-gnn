@@ -1,1 +1,583 @@
+#!/usr/bin/env python3
+import os, math, glob, pickle, argparse, json
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import f1_score, log_loss
+from sklearn.model_selection import train_test_split
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions import Categorical
+
+R_CHOICES = [400, 600, 800, 1200]
+
+def _load_split(split_dir, split_name):
+    inertial_dir = os.path.join(split_dir, "Inertial Signals")
+    sigs = []
+    used = None
+    for prefix in ("body_acc", "total_acc"):
+        cand = [f"{prefix}_{ax}_{split_name}.txt" for ax in ("x","y","z")]
+        if all(os.path.exists(os.path.join(inertial_dir, f)) for f in cand):
+            for f in cand:
+                sigs.append(np.loadtxt(os.path.join(inertial_dir, f))[...,None])
+            used = prefix
+            break
+    if used is None:
+        raise FileNotFoundError(f"No acc files found in {inertial_dir}")
+    for ax in ("x","y","z"):
+        sigs.append(np.loadtxt(os.path.join(inertial_dir, f"body_gyro_{ax}_{split_name}.txt"))[...,None])
+    X = np.concatenate(sigs, axis=2).astype(np.float32)
+    y = np.loadtxt(os.path.join(split_dir, f"y_{split_name}.txt")).astype(int) - 1
+    return X, y
+
+def load_uci_har_all(data_dir):
+    train_dir, test_dir = os.path.join(data_dir,"train"), os.path.join(data_dir,"test")
+    X_train, y_train = _load_split(train_dir, "train")
+    X_test,  y_test  = _load_split(test_dir,  "test")
+    return X_train, y_train, X_test, y_test
+
+def spectral_scale(W, target=0.85, iters=50, seed=42):
+    R = W.shape[0]
+    rng = np.random.default_rng(seed)
+    v = rng.normal(size=(R,)).astype(np.float32)
+    v /= (np.linalg.norm(v)+1e-12)
+    for _ in range(iters):
+        v = W @ v
+        n = np.linalg.norm(v)+1e-12
+        v /= n
+    lam = float(np.linalg.norm(W @ v))
+    if lam > 1e-8:
+        W *= (target/lam)
+    return W
+
+def esn_encode_batch(X, Win, Wres, leak=0.25, washout=32):
+    N, T, C = X.shape
+    R = Win.shape[0]
+    feats = np.empty((N, 3*R), dtype=np.float32)
+    for i in range(N):
+        h = np.zeros((R,), np.float32)
+        H_last=None; H_sum=np.zeros(R, np.float32); H_sq=np.zeros(R, np.float32); cnt=0
+        for t in range(T):
+            pre = Win @ X[i,t] + Wres @ h
+            h = (1.0-leak)*h + leak*np.tanh(pre)
+            if t >= washout:
+                H_last=h; H_sum+=h; H_sq+=h*h; cnt+=1
+        K = max(cnt,1)
+        mu = H_sum / K
+        std = np.sqrt(np.maximum(H_sq / K - mu**2, 0.0))
+        last = H_last if H_last is not None else h
+        vec = np.concatenate([last, mu, std])
+        feats[i] = vec / (np.linalg.norm(vec)+1e-8)
+    return feats
+
+def grid_temperature(logits_val, y_val, grid=np.linspace(0.5, 5.0, 19)):
+    z = logits_val - logits_val.max(axis=1, keepdims=True)
+    bestT, bestNLL = 1.0, 1e9
+    for T in grid:
+        p = np.exp(z/T); p /= p.sum(axis=1, keepdims=True)
+        nll = log_loss(y_val, p, labels=np.arange(p.shape[1]))
+        if nll < bestNLL: bestNLL, bestT = nll, float(T)
+    return bestT
+
+def expected_calibration_error(prob_max, correct, M=15):
+    bins = np.linspace(0,1,M+1)
+    e = 0.0
+    N = len(prob_max)
+    for b in range(M):
+        lo,hi = bins[b], bins[b+1]
+        idx = (prob_max >= lo) & (prob_max <= hi) if b==0 else (prob_max > lo) & (prob_max <= hi)
+        if idx.sum()==0: continue
+        acc  = correct[idx].mean()
+        conf = prob_max[idx].mean()
+        e += (idx.sum()/N)*abs(acc-conf)
+    return float(e)
+
+def build_shared_esn_artefact(data_dir, save_path, seed=42):
+    X_tr_full, y_tr_full, X_te, y_te = load_uci_har_all(data_dir)
+    X_tr, X_va, y_tr, y_va = train_test_split(X_tr_full, y_tr_full, test_size=0.20, random_state=seed, stratify=y_tr_full)
+    mu = X_tr.mean(axis=(0,1), keepdims=True).astype(np.float32)
+    sd = (X_tr.std(axis=(0,1), keepdims=True)+1e-8).astype(np.float32)
+    norm = lambda X: (X - mu)/sd
+    X_tr, X_va, X_te = norm(X_tr), norm(X_va), norm(X_te)
+    R_FULL, C = 1200, 6
+    rng = np.random.default_rng(seed)
+    Win_full  = (rng.normal(0,1,size=(R_FULL,C)).astype(np.float32) * 0.6)
+    Wres_full = rng.normal(0,1,size=(R_FULL,R_FULL)).astype(np.float32)
+    mask = (rng.random(size=Wres_full.shape) < 0.05); Wres_full *= mask
+    Wres_full = spectral_scale(Wres_full, target=0.85, iters=50, seed=seed)
+    results = {}
+    best_R, best_val = None, -1.0
+    for R in R_CHOICES:
+        Win = Win_full[:R]; Wres = Wres_full[:R,:R]
+        H_tr = esn_encode_batch(X_tr, Win, Wres, leak=0.25, washout=32)
+        H_va = esn_encode_batch(X_va, Win, Wres, leak=0.25, washout=32)
+        H_te = esn_encode_batch(X_te, Win, Wres, leak=0.25, washout=32)
+        sc = StandardScaler().fit(H_tr)
+        Z_tr, Z_va, Z_te = sc.transform(H_tr), sc.transform(H_va), sc.transform(H_te)
+        pca = PCA(n_components=0.95, svd_solver="full").fit(Z_tr)
+        Z_tr, Z_va, Z_te = pca.transform(Z_tr), pca.transform(Z_va), pca.transform(Z_te)
+        clf = LogisticRegression(max_iter=12000, solver="lbfgs", C=0.7, multi_class="multinomial", random_state=seed)
+        clf.fit(Z_tr, y_tr)
+        T_star = grid_temperature(clf.decision_function(Z_va), y_va)
+        z = clf.decision_function(Z_va)/max(T_star,1e-8); z -= z.max(axis=1,keepdims=True)
+        P = np.exp(z); P /= P.sum(axis=1,keepdims=True)
+        vacc = (P.argmax(1)==y_va).mean()
+        zt = clf.decision_function(Z_te)/max(T_star,1e-8); zt -= zt.max(axis=1,keepdims=True)
+        Pt = np.exp(zt); Pt /= Pt.sum(axis=1,keepdims=True)
+        tacc = (Pt.argmax(1)==y_te).mean()
+        mf1 = f1_score(y_te, Pt.argmax(1), average="macro")
+        ece = expected_calibration_error(Pt.max(1), (Pt.argmax(1)==y_te))
+        results[R] = dict(val_acc=float(vacc), test_acc=float(tacc), macro_f1=float(mf1), ece=float(ece),
+                          scaler=sc, pca=pca, clf=clf, T=float(T_star), pca_dims=int(Z_va.shape[1]))
+        if vacc > best_val: best_val, best_R = vacc, R
+    artefact = {
+        "R_full": R_FULL,
+        "best_R": int(best_R),
+        "Win_full": Win_full,
+        "Wres_full": Wres_full,
+        "scaler": results[best_R]["scaler"],
+        "pca": results[best_R]["pca"],
+        "clf": results[best_R]["clf"],
+        "T": results[best_R]["T"],
+        "mu": mu, "sd": sd,
+        "config": {"LEAK":0.25,"WASHOUT":32,"SPECTRAL":0.85,"SPARSITY":0.05,"INPUT_SCALE":0.6,
+                   "PCA_VARIANCE":0.95,"R_CHOICES":R_CHOICES,"seed":seed},
+        "metrics": {"val_by_R": {int(r):results[r]["val_acc"] for r in results},
+                    "test_by_R":{int(r):{"acc":results[r]["test_acc"],"macro_f1":results[r]["macro_f1"],
+                                         "ece":results[r]["ece"],"pca_dims":results[r]["pca_dims"]} for r in results}}
+    }
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    with open(save_path, "wb") as f:
+        pickle.dump(artefact, f)
+    return artefact
+
+def load_or_build_artefact(data_dir, artefact_path, seed=42):
+    if os.path.exists(artefact_path):
+        with open(artefact_path,"rb") as f:
+            a = pickle.load(f)
+        keys = {"Win_full","Wres_full","best_R","mu","sd","scaler","pca","clf","T"}
+        if isinstance(a, dict) and keys.issubset(a.keys()):
+            return a
+    return build_shared_esn_artefact(data_dir, artefact_path, seed=seed)
+
+class ESNClassifier:
+    def __init__(self, a):
+        self.a = a
+        cfg = a.get("config",{})
+        self.leak = cfg.get("LEAK",0.25)
+        self.washout = cfg.get("WASHOUT",32)
+    def predict_proba(self, window_128x6: np.ndarray, R_used=None):
+        X = (window_128x6 - self.a["mu"].squeeze()) / self.a["sd"].squeeze()
+        R = self.a["best_R"]
+        Win = self.a["Win_full"][:R]; Wres = self.a["Wres_full"][:R,:R]
+        h = np.zeros((R,), np.float32); states=[]
+        for t in range(X.shape[0]):
+            pre = Win @ X[t] + Wres @ h
+            h = (1.0-self.leak)*h + self.leak*np.tanh(pre)
+            if t >= self.washout: states.append(h.copy())
+        if len(states)==0:
+            feat = np.zeros((3*R,), np.float32)
+        else:
+            S = np.stack(states,0)
+            feat = np.concatenate([S[-1], S.mean(0), S.std(0)])
+        feat = feat/(np.linalg.norm(feat)+1e-8)
+        Z = self.a["scaler"].transform(feat.reshape(1,-1))
+        Z = self.a["pca"].transform(Z)
+        logits = self.a["clf"].decision_function(Z)[0]
+        T = float(self.a["T"])
+        if (R_used is not None) and ("metrics" in self.a) and ("test_by_R" in self.a["metrics"]) and (R_used in self.a["metrics"]["test_by_R"]):
+            acc_best = self.a["metrics"]["test_by_R"][R]["acc"] or 1.0
+            acc_used = self.a["metrics"]["test_by_R"][R_used]["acc"] or acc_best
+            T *= float(np.clip(acc_best/(acc_used+1e-8), 0.7, 1.6))
+        z = logits / max(T,1e-8); z -= z.max()
+        p = np.exp(z); p /= p.sum()
+        return p
+
+def load_test_only(data_dir):
+    test_dir = os.path.join(data_dir,"test")
+    return _load_split(test_dir,"test")
+
+class HarRoutingEnv:
+    def __init__(self, X_test, y_test, R_CHOICES, seed=42, batch_size=1, deadline_s=0.25,
+                 lambda_t=0.5, lambda_e=0.2, lambda_pi=0.2, t0=0.20, e0=0.20, device_str=None, clf=None):
+        self.X_test, self.y_test = X_test, y_test
+        self.N = len(y_test)
+        self.bsz = batch_size
+        self.D = 6
+        self.R_CHOICES = R_CHOICES
+        self.deadline_s = deadline_s
+        self.lambda_t, self.lambda_e, self.lambda_pi = lambda_t, lambda_e, lambda_pi
+        self.t0, self.e0 = t0, e0
+        self.rng = np.random.default_rng(seed)
+        self.device_str = device_str or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.clf = clf
+        self.cpu_speed = self.rng.uniform(1.0,2.0,self.D).astype(np.float32)
+        self.tx_power  = self.rng.uniform(0.4,0.8,self.D).astype(np.float32)
+        self.comp_power= self.rng.uniform(0.8,1.5,self.D).astype(np.float32)
+        self.price_w   = self.rng.uniform(0.5,1.5,self.D).astype(np.float32)
+        self.ram_cap   = self.rng.uniform(1000,2000,self.D).astype(np.float32)
+        self.ram_need  = {400:250,600:400,800:550,1200:800}
+        A = np.zeros((self.D,self.D), np.float32)
+        for i in range(self.D):
+            A[i,i]=1; A[i,(i+1)%self.D]=1; A[i,(i-1)%self.D]=1
+        deg = A.sum(1, keepdims=True)
+        self.Ahat = A/(deg+1e-8)
+        self.reset()
+    def reset(self):
+        self.t=0.0; self.k=0
+        self.queue = np.zeros(self.D, np.float32)
+        self.util  = np.zeros(self.D, np.float32)
+        self.soc   = np.ones(self.D, np.float32)*0.9
+        self.temp  = np.ones(self.D, np.float32)*30.0
+        self.hb_age= np.zeros(self.D, np.float32)
+        self.tel_age=np.zeros(self.D, np.float32)
+        self._refresh_bw()
+        self.window_log=[]
+        return self._state()
+    def _refresh_bw(self):
+        self.uplink = np.random.uniform(5,20,self.D).astype(np.float32)
+        self.bw_hat = self.uplink * np.random.uniform(0.8,1.2,self.D).astype(np.float32)
+    def _state(self):
+        device = torch.device(self.device_str)
+        F = np.zeros((self.bsz,self.D,9), np.float32)
+        for d in range(self.D):
+            F[0,d]=[
+                self.queue[d], self.util[d], self.soc[d], self.temp[d]/100.0,
+                self.bw_hat[d]/20.0, self.hb_age[d]/5.0, self.tel_age[d]/5.0,
+                (self.ram_cap[d])/2000.0, self.price_w[d]/2.0
+            ]
+        run_mask = np.ones((self.bsz,self.D), np.bool_)
+        slc_mask = np.ones((self.bsz,self.D,len(self.R_CHOICES)), np.bool_)
+        for d in range(self.D):
+            if (self.soc[d] <= 0.1) or (self.temp[d] >= 85.0):
+                run_mask[0,d]=False
+            for ri,r in enumerate(self.R_CHOICES):
+                if self.ram_cap[d] < self.ram_need[r]:
+                    slc_mask[0,d,ri]=False
+        return {
+            "A": torch.as_tensor(self.Ahat, dtype=torch.float32, device=device)[None,...].expand(self.bsz,-1,-1),
+            "X": torch.as_tensor(F, dtype=torch.float32, device=device),
+            "run_mask": torch.as_tensor(run_mask, dtype=torch.bool, device=device),
+            "slice_mask": torch.as_tensor(slc_mask, dtype=torch.bool, device=device)
+        }
+    def step(self, actions):
+        device = torch.device(self.device_str)
+        a_run = actions["runner"]
+        a_slc = actions["slice"]
+        runner = int(a_run[0].item())
+        r_idx  = int(a_slc[0].item())
+        R_used = self.R_CHOICES[r_idx]
+        idx = self.k % self.N
+        origin = idx % self.D
+        x = self.X_test[idx]; y = int(self.y_test[idx])
+        p = self.clf.predict_proba(x, R_used)
+        yhat = int(p.argmax()); correct = float(yhat==y)
+        prob_max = float(p.max()); nll = float(-math.log(p[y]+1e-12))
+        payload_bits = 128*6*32
+        if runner == origin:
+            T_tx=0.0; energy_tx=0.0; local=1
+        else:
+            T_tx = payload_bits/(self.uplink[origin]*1e6)
+            energy_tx = float(self.tx_power[origin]*T_tx); local=0
+        T_queue = float(self.queue[runner]*0.01)
+        base_compute=0.015
+        T_compute = float(base_compute*(R_used/400.0)/max(self.cpu_speed[runner],1e-6))
+        energy_compute = float(self.comp_power[runner]*T_compute)
+        T_total = T_tx + T_queue + T_compute
+        deadline_miss = int(T_total > self.deadline_s)
+        price_cost = float(self.price_w[runner]*(T_compute + 0.5*T_tx*(1-local)))
+        r_acc = correct
+        r_lat = -self.lambda_t*(T_total/self.t0)
+        r_eng = -self.lambda_e*((energy_tx+energy_compute)/self.e0)
+        r_price = -self.lambda_pi*self.price_w[runner]
+        reward = float(r_acc + r_lat + r_eng + r_price)
+        self.window_log.append({
+            "tstamp": self.t,
+            "origin_id": origin,
+            "device": runner,
+            "slice_R": R_used,
+            "mask_applied": 0,
+            "mask_reason": "",
+            "hb_age_origin": float(self.hb_age[origin]),
+            "hb_age_runner": float(self.hb_age[runner]),
+            "tel_age_origin": float(self.tel_age[origin]),
+            "tel_age_runner": float(self.tel_age[runner]),
+            "uplink_origin": float(self.uplink[origin]),
+            "downlink_runner": float(self.uplink[runner]),
+            "b_hat": float(self.bw_hat[origin]),
+            "residual_bw": float(max(0.0, self.uplink[origin] - payload_bits/1e6)),
+            "bandwidth_err": float(abs(self.uplink[origin]-self.bw_hat[origin])),
+            "payload_bytes": float(payload_bits/8),
+            "T_tx": float(T_tx),
+            "T_queue": float(T_queue),
+            "T_compute": float(T_compute),
+            "T_total": float(T_total),
+            "deadline_miss": int(deadline_miss),
+            "energy_tx": float(energy_tx),
+            "energy_compute": float(energy_compute),
+            "price_cost": float(price_cost),
+            "queue_len_before": float(self.queue[runner]),
+            "queue_len_after": float(self.queue[runner]*0.9 + 1.0),
+            "util_before": float(self.util[runner]),
+            "pred_label": int(yhat),
+            "true_label": int(y),
+            "prob_max": float(prob_max),
+            "nll": float(nll),
+            "reward": float(reward),
+            "r_acc": float(r_acc),
+            "r_lat": float(r_lat),
+            "r_eng": float(r_eng),
+            "r_price": float(r_price),
+            "local": int(local),
+        })
+        self.t += 0.05; self.k += 1
+        self.queue[runner] = self.queue[runner]*0.9 + np.random.uniform(0.5,1.5)
+        self.util = 0.95*self.util; self.util[runner] += 0.05
+        self.soc[runner] = max(0.0, self.soc[runner]-0.001)
+        self.temp[runner] = min(85.0, self.temp[runner]+0.2)
+        self.temp = 30.0 + (self.temp-30.0)*0.99
+        self.hb_age += 0.05; self.tel_age += 0.05
+        if np.random.rand()<0.1:
+            self.hb_age[np.random.randint(self.D)] = 0.0
+            self.tel_age[np.random.randint(self.D)] = 0.0
+            self._refresh_bw()
+        done = (self.k >= self.N)
+        return self._state(), torch.as_tensor([reward], dtype=torch.float32, device=device), bool(done)
+
+class RouterGCN(nn.Module):
+    def __init__(self, in_dim=9, hidden=64, n_devices=6, n_slices=len(R_CHOICES)):
+        super().__init__()
+        self.gc1 = nn.Linear(in_dim, hidden)
+        self.gc2 = nn.Linear(hidden, hidden)
+        self.ln1 = nn.LayerNorm(hidden)
+        self.ln2 = nn.LayerNorm(hidden)
+        self.run_head   = nn.Linear(hidden, 1)
+        self.slice_head = nn.Linear(hidden, n_slices)
+        self.value_head = nn.Linear(hidden, 1)
+    def forward(self, A, X):
+        H = torch.bmm(A, self.gc1(X))
+        H = F.relu(self.ln1(H))
+        H = torch.bmm(A, self.gc2(H))
+        H = F.relu(self.ln2(H))
+        run_logits   = self.run_head(H).squeeze(-1)
+        slice_logits = self.slice_head(H)
+        value = self.value_head(H.mean(dim=1))
+        return run_logits, slice_logits, value
+
+def masked_categorical(logits, mask_bool):
+    very_neg = torch.finfo(logits.dtype).min
+    logits_masked = torch.where(mask_bool, logits, torch.full_like(logits, very_neg))
+    return Categorical(logits=logits_masked)
+
+def sample_action(model, state, device):
+    A = state["A"]; X = state["X"]
+    run_mask  = state["run_mask"]; slice_mask = state["slice_mask"]
+    B = X.shape[0]
+    run_logits, slice_logits, value = model(A, X)
+    value = value.squeeze(-1)
+    run_dist = masked_categorical(run_logits, run_mask)
+    a_run = run_dist.sample()
+    slc_logits_sel = slice_logits[torch.arange(B, device=device), a_run, :]
+    slc_mask_sel   = slice_mask[torch.arange(B, device=device), a_run, :]
+    slice_dist = masked_categorical(slc_logits_sel, slc_mask_sel)
+    a_slc = slice_dist.sample()
+    logp = run_dist.log_prob(a_run) + slice_dist.log_prob(a_slc)
+    return a_run, a_slc, logp, value
+
+def compute_gae(rew_t, val_t, v_last, done_t, gamma=0.99, lam=0.95):
+    T, B = rew_t.shape
+    adv = torch.zeros_like(rew_t)
+    lastgaelam = torch.zeros(B, device=rew_t.device)
+    for t in reversed(range(T)):
+        nonterm = 1.0 - done_t[t].float()
+        nextv = v_last if t==T-1 else val_t[t+1]
+        delta = rew_t[t] + gamma*nonterm*nextv - val_t[t]
+        lastgaelam = delta + gamma*lam*nonterm*lastgaelam
+        adv[t] = lastgaelam
+    ret = adv + val_t
+    adv = (adv - adv.mean()) / (adv.std(unbiased=False)+1e-8)
+    return adv, ret
+
+def flat(x):
+    T,B = x.shape[:2]
+    return x.reshape(T*B, *x.shape[2:])
+
+def train_router(env, model, updates=10, rollout_T=256, lr=3e-4, device=None):
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    train_logs = []
+    state = env.reset()
+    for up in range(1, updates+1):
+        A_buf=[]; X_buf=[]; runM_buf=[]; slcM_buf=[]
+        a_run_buf=[]; a_slc_buf=[]; logp_old_buf=[]; val_buf=[]
+        rew_buf=[]; done_buf=[]
+        for t in range(rollout_T):
+            with torch.no_grad():
+                a_run, a_slc, logp, value = sample_action(model, state, device)
+            next_state, reward, done = env.step({"runner":a_run, "slice":a_slc})
+            A_buf.append(state["A"]); X_buf.append(state["X"])
+            runM_buf.append(state["run_mask"]); slcM_buf.append(state["slice_mask"])
+            a_run_buf.append(a_run); a_slc_buf.append(a_slc)
+            logp_old_buf.append(logp); val_buf.append(value)
+            rew_buf.append(reward.view(-1)); done_buf.append(torch.as_tensor([done], dtype=torch.bool, device=device))
+            state = next_state
+            if done:
+                state = env.reset()
+        with torch.no_grad():
+            _, _, v_last = model(state["A"], state["X"])
+            v_last = v_last.squeeze(-1)
+        A_t       = torch.stack(A_buf,0)
+        X_t       = torch.stack(X_buf,0)
+        runM_t    = torch.stack(runM_buf,0)
+        slcM_t    = torch.stack(slcM_buf,0)
+        a_run_t   = torch.stack(a_run_buf,0)
+        a_slc_t   = torch.stack(a_slc_buf,0)
+        logp_old_t= torch.stack(logp_old_buf,0)
+        val_t     = torch.stack(val_buf,0)
+        rew_t     = torch.stack(rew_buf,0)
+        done_t    = torch.stack(done_buf,0)
+        adv, ret = compute_gae(rew_t, val_t, v_last, done_t, gamma=0.99, lam=0.95)
+        adv_mean, adv_std = float(adv.mean().cpu()), float(adv.std(unbiased=False).cpu())
+        N = a_run_t.numel()
+        A_mb = flat(A_t); X_mb = flat(X_t)
+        runM_mb = flat(runM_t); slcM_mb = flat(slcM_t)
+        a_run_mb = flat(a_run_t).long(); a_slc_mb = flat(a_slc_t).long()
+        adv_mb = flat(adv); ret_mb = flat(ret)
+        logp_old_mb = flat(logp_old_t)
+        clip_eps, c_vf, c_ent = 0.2, 0.5, 0.01
+        losses={"policy":[], "value":[], "entropy":[], "kl":[]}
+        epochs=4; mb_size = min(2048, N)
+        for _ in range(epochs):
+            perm = torch.randperm(N, device=device)
+            for s in range(0, N, mb_size):
+                idx = perm[s:s+mb_size]
+                run_logits, slice_logits, v_pred = model(A_mb[idx], X_mb[idx])
+                v_pred = v_pred.squeeze(-1)
+                run_dist = masked_categorical(run_logits, runM_mb[idx])
+                logp_run = run_dist.log_prob(a_run_mb[idx])
+                m = idx.shape[0]
+                sel = torch.arange(m, device=device)
+                slc_logits_sel = slice_logits[sel, a_run_mb[idx], :]
+                slc_mask_sel   = slcM_mb[idx][sel, a_run_mb[idx], :]
+                slice_dist = masked_categorical(slc_logits_sel, slc_mask_sel)
+                logp_slice = slice_dist.log_prob(a_slc_mb[idx])
+                new_logp = logp_run + logp_slice
+                ratio = torch.exp(new_logp - logp_old_mb[idx])
+                surr1 = ratio * adv_mb[idx]
+                surr2 = torch.clamp(ratio, 1.0-clip_eps, 1.0+clip_eps) * adv_mb[idx]
+                policy_loss = -torch.mean(torch.min(surr1, surr2))
+                value_loss = 0.5 * F.mse_loss(v_pred, ret_mb[idx])
+                entropy = run_dist.entropy().mean() + slice_dist.entropy().mean()
+                approx_kl = torch.mean((logp_old_mb[idx] - new_logp)) * -1.0
+                loss = policy_loss + c_vf*value_loss - c_ent*entropy
+                opt.zero_grad(set_to_none=True); loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                opt.step()
+                losses["policy"].append(float(policy_loss.detach().cpu()))
+                losses["value"].append(float(value_loss.detach().cpu()))
+                losses["entropy"].append(float(entropy.detach().cpu()))
+                losses["kl"].append(float(approx_kl.detach().cpu()))
+        train_logs.append({
+            "update": up, "adv_mean":adv_mean, "adv_std":adv_std,
+            "policy_loss": np.mean(losses["policy"]),
+            "value_loss": np.mean(losses["value"]),
+            "entropy": np.mean(losses["entropy"]),
+            "kl": np.mean(losses["kl"]),
+            "steps": rollout_T
+        })
+        print(f"[update {up}/{updates}] pol={train_logs[-1]['policy_loss']:.4f} val={train_logs[-1]['value_loss']:.4f} ent={train_logs[-1]['entropy']:.3f} kl={train_logs[-1]['kl']:.4f} advμ={adv_mean:.3f} advσ={adv_std:.3f}")
+    return pd.DataFrame(train_logs)
+
+def evaluate(env, router, max_steps=3000, device=None):
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    state = env.reset()
+    steps = min(max_steps, env.N)
+    B = 1
+    for _ in range(steps):
+        with torch.no_grad():
+            run_logits, slice_logits, _ = router(state["A"], state["X"])
+            very_neg = torch.finfo(run_logits.dtype).min
+            run_logits_masked = torch.where(state["run_mask"], run_logits, torch.full_like(run_logits, very_neg))
+            a_run = torch.argmax(run_logits_masked, dim=1)
+            slc_logits_sel = slice_logits[torch.arange(B, device=device), a_run, :]
+            slc_mask_sel   = state["slice_mask"][torch.arange(B, device=device), a_run, :]
+            slc_logits_masked = torch.where(slc_mask_sel, slc_logits_sel, torch.full_like(slc_logits_sel, very_neg))
+            a_slc = torch.argmax(slc_logits_masked, dim=1)
+        state, _, done = env.step({"runner":a_run, "slice":a_slc})
+        if done: break
+    return pd.DataFrame(env.window_log)
+
+def compute_metrics(df: pd.DataFrame):
+    acc = (df.pred_label==df.true_label).mean()
+    macro_f1 = f1_score(df.true_label, df.pred_label, average="macro")
+    nll = df.nll.mean()
+    ece = expected_calibration_error(df.prob_max.values, (df.pred_label.values==df.true_label.values))
+    total_reward = df.reward.sum()
+    lat_p95 = df.T_total.quantile(0.95)
+    throughput = len(df)/df.T_total.sum()
+    miss_rate = df.deadline_miss.mean()
+    e_per = (df.energy_tx+df.energy_compute).mean()
+    price_per = df.price_cost.mean()
+    counts = df.device.value_counts().values
+    jain = (counts.sum()**2)/(len(counts)*(counts**2).sum()) if len(counts)>0 else float('nan')
+    return {
+        "accuracy":float(acc), "macro_f1":float(macro_f1), "nll":float(nll), "ece":float(ece),
+        "total_reward":float(total_reward), "lat_p95_ms": float(lat_p95*1000.0),
+        "throughput": float(throughput), "deadline_miss_rate": float(miss_rate),
+        "energy_per": float(e_per), "price_per": float(price_per), "jain": float(jain)
+    }
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data_dir", type=str, default="./data/UCI_HAR_Dataset")
+    ap.add_argument("--artefact_path", type=str, default="artifacts/shared_esn.pkl")
+    ap.add_argument("--out_dir", type=str, default="results/learned")
+    ap.add_argument("--updates", type=int, default=10)
+    ap.add_argument("--rollout_T", type=int, default=256)
+    ap.add_argument("--hidden", type=int, default=64)
+    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--lambda_t", type=float, default=0.5)
+    ap.add_argument("--lambda_e", type=float, default=0.2)
+    ap.add_argument("--lambda_pi", type=float, default=0.2)
+    ap.add_argument("--t0", type=float, default=0.20)
+    ap.add_argument("--e0", type=float, default=0.20)
+    ap.add_argument("--max_steps", type=int, default=3000)
+    ap.add_argument("--seed", type=int, default=42)
+    args = ap.parse_args()
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    np.random.seed(args.seed); torch.manual_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    artefact = load_or_build_artefact(args.data_dir, args.artefact_path, seed=args.seed)
+    _, _, X_test, y_test = load_uci_har_all(args.data_dir)
+    clf = ESNClassifier(artefact)
+
+    env = HarRoutingEnv(
+        X_test, y_test, R_CHOICES=R_CHOICES, seed=args.seed, batch_size=1, deadline_s=0.25,
+        lambda_t=args.lambda_t, lambda_e=args.lambda_e, lambda_pi=args.lambda_pi,
+        t0=args.t0, e0=args.e0, device_str=("cuda" if torch.cuda.is_available() else "cpu"), clf=clf
+    )
+    router = RouterGCN(hidden=args.hidden, n_devices=6, n_slices=len(R_CHOICES)).to(device)
+
+    train_df = train_router(env, router, updates=args.updates, rollout_T=args.rollout_T, lr=args.lr, device=device)
+    eval_df  = evaluate(env, router, max_steps=args.max_steps, device=device)
+
+    train_csv = os.path.join(args.out_dir, "train_metrics.csv")
+    eval_csv  = os.path.join(args.out_dir, "window_log.csv")
+    train_df.to_csv(train_csv, index=False)
+    eval_df.to_csv(eval_csv, index=False)
+    metrics = compute_metrics(eval_df)
+    with open(os.path.join(args.out_dir, "metrics.json"), "w") as f:
+        json.dump(metrics, f, indent=2)
+    print(train_csv)
+    print(eval_csv)
+    print(os.path.join(args.out_dir, "metrics.json"))
+
+if __name__ == "__main__":
+    main()
 
