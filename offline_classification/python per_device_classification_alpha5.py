@@ -7,21 +7,21 @@ Per-device ESN classification on UCI-HAR with Dirichlet device splits.
 - Evaluates on the common test set; saves counts & row-normalised confusion matrices
 - Robust to missing classes per device (pads probabilities to 6 classes)
 - Optional: prior correction and train balancing
+- Saves a small JSON summary of best R and metrics per device.
 
 Usage:
-  python per_device_classification_alpha5.py \
-      --data_dir /path/to/UCI_HAR_Dataset \
-      --out_dir ./figs/perdev \
-      --alpha 5.0 \
-      --seed 42 \
-      --calibration temperature \
-      --balance_train none \
-      --use_prior_correction 0
+  python offline_classification/per_device_classification.py \
+      --data_dir ./data/UCI_HAR_Dataset \
+      --out_dir artifacts/perdev \
+      --summary_path artifacts/perdev_summary.json \
+      --alpha 5.0 --seed 42 --calibration temperature \
+      --balance_train none --use_prior_correction 0
 """
 
 import os
 import argparse
 import warnings
+import json
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Tuple, List
@@ -263,12 +263,13 @@ def run_per_device(data_dir: str, alpha: float, seed: int, out_dir: str,
                    calibration: str = "temperature",
                    balance_train: str = "none",
                    use_prior_correction: bool = False,
-                   pca_variance: float = PCA_VARIANCE):
+                   pca_variance: float = PCA_VARIANCE,
+                   summary_path: str = "artifacts/perdev_summary.json"):
     X_tr_full, y_tr_full, X_te, y_te = load_uci_har(data_dir)
     assert X_tr_full.shape[1:] == (T_EXPECTED, C_EXPECTED)
     assert X_te.shape[1:] == (T_EXPECTED, C_EXPECTED)
 
-    # Global class prior (use full TRAIN as proxy for test prior)
+    
     pi_global = np.bincount(y_tr_full, minlength=K_CLASSES).astype(np.float64)
     pi_global = np.clip(pi_global / pi_global.sum(), 1e-8, 1.0)
 
@@ -282,22 +283,22 @@ def run_per_device(data_dir: str, alpha: float, seed: int, out_dir: str,
 
         X_tr, X_va, y_tr, y_va = safe_train_val_split(Xd, yd, seed=seed+10*d, test_size=0.20)
 
-        # Optional: balance TRAIN only (VAL stays natural for calibration realism)
+        
         X_tr_bal, y_tr_bal = balance_by_class(X_tr, y_tr, balance_train, seed=seed+20*d)
 
-        # Normalisation from TRAIN (balanced) stats
+        
         mu  = X_tr_bal.mean(axis=(0,1), keepdims=True).astype(np.float32)
         sd  = (X_tr_bal.std(axis=(0,1), keepdims=True) + 1e-8).astype(np.float32)
         norm = lambda X: (X - mu) / sd
         X_tr_z, X_va_z, X_te_z = norm(X_tr_bal), norm(X_va), norm(X_te)
 
-        # ESN weights (max slice)
+        
         R_full = max(R_CHOICES)
         Win_full, Wres_full = init_esn_full(C=C_EXPECTED, R_full=R_full,
                                             input_scale=INPUT_SCALE, spectral=SPECTRAL,
                                             sparsity=SPARSITY, seed=seed+100*d)
 
-        # Per-device TRAIN prior (for prior correction)
+        
         pi_train = np.bincount(y_tr, minlength=K_CLASSES).astype(np.float64)
         pi_train = np.clip(pi_train / max(pi_train.sum(), 1.0), 1e-8, 1.0)
         log_prior_adj = np.log(pi_global / pi_train) if use_prior_correction else np.zeros(K_CLASSES, dtype=np.float64)
@@ -315,7 +316,7 @@ def run_per_device(data_dir: str, alpha: float, seed: int, out_dir: str,
             pca = PCA(n_components=pca_variance, svd_solver="full").fit(Z_tr)
             Z_tr, Z_va, Z_te = pca.transform(Z_tr), pca.transform(Z_va), pca.transform(Z_te)
 
-            # Device-adaptive C (clip for stability)
+            
             ntr = len(y_tr_bal)
             C_adj = float(np.clip(10.0 * (ntr / 1000.0), 0.1, 5.0))
 
@@ -324,12 +325,12 @@ def run_per_device(data_dir: str, alpha: float, seed: int, out_dir: str,
                 warnings.simplefilter("ignore", ConvergenceWarning)
                 clf.fit(Z_tr, y_tr_bal)
 
-            # Prior correction on logits for seen classes
+            
             adj_vec = log_prior_adj[clf.classes_]
             logits_va = clf.decision_function(Z_va) + adj_vec
             logits_te = clf.decision_function(Z_te) + adj_vec
 
-            # Calibration
+            
             calib = calibration.lower()
             if calib == "vector" and np.unique(y_va).size >= 2:
                 calibrator = VectorScaling(C=1.0, seed=seed+d).fit(logits_va, y_va)
@@ -340,7 +341,7 @@ def run_per_device(data_dir: str, alpha: float, seed: int, out_dir: str,
                 val_probs_raw = softmax_logits(logits_va / max(T_star, 1e-8))
                 P_te_raw = softmax_logits(logits_te / max(T_star, 1e-8))
 
-            # IMPORTANT: align VAL probs to all 6 classes before computing val acc
+            # Align VAL probs to all 6 classes before computing val acc
             val_probs = align_proba(val_probs_raw, clf.classes_, K_CLASSES)
             val_acc = accuracy_score(y_va, val_probs.argmax(1))
 
@@ -349,12 +350,12 @@ def run_per_device(data_dir: str, alpha: float, seed: int, out_dir: str,
 
             perR[R] = dict(val_acc=val_acc, P_te=P_te)
 
-        # pick best R by VAL acc (tie -> larger R)
+        
         best_val = max(v["val_acc"] for v in perR.values())
         best_R_candidates = [R for R,v in perR.items() if abs(v["val_acc"] - best_val) < 1e-12]
         best_R = max(best_R_candidates)
 
-        # test metrics + confusion matrices
+        
         P_te = perR[best_R]["P_te"]
         y_pred = P_te.argmax(1)
         test_acc = accuracy_score(y_te, y_pred)
@@ -370,18 +371,36 @@ def run_per_device(data_dir: str, alpha: float, seed: int, out_dir: str,
               f"TEST acc={test_acc:.3f} | NLL={nll:.3f} | ECE={ece*100:.2f}% "
               f"| saved: {base}_counts.png, {base}_norm.png")
 
-        summary.append((d, best_R, best_val, test_acc, nll, ece))
+        summary.append({
+            "device": int(d),
+            "best_R": int(best_R),
+            "val_acc": float(best_val),
+            "test_acc": float(test_acc),
+            "nll": float(nll),
+            "ece_percent": float(ece*100.0)
+        })
 
     print("\nPer-device best-R summary (by validation accuracy):")
     print("Dev  R*   ValAcc   TestAcc   NLL     ECE(%)")
-    for d,bR,vA,tA,nll,ece in summary:
-        print(f"D{d}  {str(bR).ljust(4)} {vA:6.3f}   {tA:7.3f}  {nll:6.3f}   {ece*100:6.2f}")
+    for row in summary:
+        d,bR,vA,tA,nll,ece = row["device"], row["best_R"], row["val_acc"], row["test_acc"], row["nll"], row["ece_percent"]
+        print(f"D{d}  {str(bR).ljust(4)} {vA:6.3f}   {tA:7.3f}  {nll:6.3f}   {ece:6.2f}")
+
+    
+    os.makedirs(os.path.dirname(summary_path) or ".", exist_ok=True)
+    with open(summary_path, "w") as f:
+        json.dump({"alpha": float(alpha), "seed": int(seed), "summary": summary}, f, indent=2)
+    print(f"[saved] Summary -> {summary_path}")
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Per-device ESN on UCI-HAR with Dirichlet splits.")
-    p.add_argument("--data_dir", type=str, required=True, help="Path to UCI_HAR_Dataset root (with train/test).")
-    p.add_argument("--out_dir", type=str, default="./figs/perdev", help="Output directory for figures.")
+    p.add_argument("--data_dir", type=str, default=os.getenv("UCI_HAR_DIR", "./data/UCI_HAR_Dataset"),
+                   help="Path to UCI_HAR_Dataset root (with train/test).")
+    p.add_argument("--out_dir", type=str, default="artifacts/perdev",
+                   help="Output directory for figures (counts & normalised).")
+    p.add_argument("--summary_path", type=str, default="artifacts/perdev_summary.json",
+                   help="Path to save JSON summary with per-device best R and metrics.")
     p.add_argument("--alpha", type=float, default=5.0, help="Dirichlet concentration.")
     p.add_argument("--seed", type=int, default=42, help="Random seed.")
     p.add_argument("--calibration", type=str, default="temperature", choices=["temperature","vector"],
@@ -405,4 +424,5 @@ if __name__ == "__main__":
         balance_train=args.balance_train,
         use_prior_correction=bool(args.use_prior_correction),
         pca_variance=args.pca_variance,
+        summary_path=args.summary_path
     )
