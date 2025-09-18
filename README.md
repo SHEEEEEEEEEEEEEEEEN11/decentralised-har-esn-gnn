@@ -58,7 +58,7 @@ These scripts save ESN → Logistic Regression artefacts for downstream routing.
 python offline_classification/shared_classification.py --data_dir /path/to/UCI_HAR_Dataset --save_path artifacts/shared_esn.pkl
 
  Per-device ESN classifiers (Dirichlet α=5)
-python offline_classification/per_device_classification.py --data_dir /path/to/UCI_HAR_Dataset --save_path artifacts/per_device_alpha5.pkl
+python offline_classification/per_device_classification_alpha5.py --data_dir /path/to/UCI_HAR_Dataset --save_path artifacts/per_device_alpha5.pkl
 
 After building the offline artefacts, run the routing policies.
 Each script trains a router (stochastic PPO) and evaluates using either a learned or heuristic strategy.
